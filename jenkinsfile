@@ -1,0 +1,129 @@
+def Destinationhost = [
+"dev-testing-cluster.cluster-cz3ofpcbbdm1.us-east-2.rds.amazonaws.com"
+]
+
+pipeline {
+  agent {
+        label 'evdata'
+  }
+  options {
+           buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '30'))
+  }
+  parameters {
+    string(name: 'SRC_DB_HOST',
+      description: 'Enter Source DB Host name. (Make sure there is no whitespace at the end.) ')
+    string(name: 'SRC_DB_NAME',
+      description: 'Enter Source DB name. (Make sure there is no whitespace at the end.)')
+    string(name: 'SRC_DB_USERNAME',
+      description: 'Enter Source DB user name. (Make sure there is no whitespace at the end.)')
+    string(name: 'SRC_DB_PWD',
+      description: 'Enter Source DB password. (Make sure there is no whitespace at the end.)')
+    choice(name: 'DEST_DB_HOST',
+      choices: Destinationhost)
+    string(name: 'DEST_DB_USERNAME',
+      description: 'Enter Source DB password. (Make sure there is no whitespace at the end.)',
+      defaultValue: 'postgres')
+    string(name: 'DEST_DB_PWD',
+      description: 'Enter Source DB password. (Make sure there is no whitespace at the end.)')
+  }
+
+  environment {
+      def DEST_DB_NAME = "${SRC_DB_NAME}"
+      def BUILD_NUMBER = "${currentBuild.number}-${SRC_DB_NAME}"
+      def WORKSPACE_ARGS = "${WORKSPACE}/${BUILD_NUMBER}"
+      def DUMP_SRC_SCHEMA_DB_CMD = "PGPASSWORD='${SRC_DB_PWD}' pg_dump -h ${SRC_DB_HOST} -U ${SRC_DB_USERNAME} -s ${SRC_DB_NAME} --verbose > '${WORKSPACE_ARGS}/schema_dump.sql'"
+      def RESTORE_SRC_SCHEMA_DB_CMD = "PGPASSWORD='${DEST_DB_PWD}' psql -h ${DEST_DB_HOST} -U ${DEST_DB_USERNAME} -d ${DEST_DB_NAME} -f '${WORKSPACE_ARGS}/schema_dump.sql'"
+      def DUMP_ROLES_USERS_CMD = "PGPASSWORD='${SRC_DB_PWD}' pg_dumpall -h ${SRC_DB_HOST} -U ${SRC_DB_USERNAME} -l ${SRC_DB_NAME} --no-role-passwords --roles-only --verbose > '${WORKSPACE_ARGS}/roles.sql'"
+      def RESTORE_ROLES_USERS_CMD = "PGPASSWORD='${DEST_DB_PWD}' psql -h ${DEST_DB_HOST} -U ${DEST_DB_USERNAME}  -f '${WORKSPACE_ARGS}/script.sql'"
+  }
+
+
+  stages {
+    stage('Setup') {
+      steps {
+        script {
+          currentBuild.displayName = "${BUILD_NUMBER}"
+        }
+      }
+    }
+    stage('Approval') {
+        steps {
+            timeout(time: 15, unit: "MINUTES") {
+                println("Please confirm the Source and Destination DB EndPoints.")
+                input message: """
+                    Source DB :- "${SRC_DB_HOST}"
+                    Destination DB :- "${DEST_DB_HOST}"
+                """
+        }
+      }
+    }
+    stage('Env_Setup') {
+        steps {
+           script {
+                sh """
+                    rm -rf ${BUILD_NUMBER}
+                    mkdir ${BUILD_NUMBER}
+                    chmod 600 ${BUILD_NUMBER}
+                    cd ${BUILD_NUMBER}
+                    rm -f pgpass.txt
+                    touch pgpass.txt
+                    touch tables.txt
+                    chmod 600 tables.txt
+                    chmod 600 pgpass.txt
+                    echo "${SRC_DB_HOST} ${SRC_DB_NAME} ${SRC_DB_USERNAME} ${SRC_DB_PWD}" >> pgpass.txt
+                    echo "${DEST_DB_HOST} ${DEST_DB_NAME} ${DEST_DB_USERNAME} ${DEST_DB_PWD}" >> pgpass.txt
+                    echo "printing details from pgpass file"
+                    cat pgpass.txt
+                    echo "Present working directory"
+                    pwd
+                """
+                sh "python3 -m pip install -r ${WORKSPACE}/requirements.txt"
+                //sh "sudo yum install postgresql-client -y" // installing postgresql client if not install
+           }
+        }
+    }
+    stage('Table_Creation') {
+        steps {
+            script {
+                 sh "python3 ${WORKSPACE}/scripts/table_creation.py '${SRC_DB_HOST}' '${WORKSPACE_ARGS}'"
+                 echo "Records has been updated to table.txt file. Proceeding to Migrate Roles & Schema Creation."
+            }
+        }
+    }
+    stage('Migrate_Roles_&_Schema') {
+        steps {
+            script {
+              // Staring dump of roles
+             sh "${DUMP_ROLES_USERS_CMD}"
+
+             sh "cat '${WORKSPACE_ARGS}/roles.sql' | sed 's/LOCALE/LC_COLLATE/' | sed 's/NOSUPERUSER//' | sed 's/NOREPLICATION//' | sed '/rdsadmin/d' | sed '/rds_/d' | sed 's/GRANTED.*/;/g' \
+            | sed 's/CREATE ROLE\\(.*\\);/\\nDO \$\$\\nBEGIN\\nCREATE ROLE \\1;\\nEXCEPTION WHEN duplicate_object THEN RAISE NOTICE \\o047%, skipping\\o047, SQLERRM USING ERRCODE = SQLSTATE\\;\\nEND\\n\$\$;\\nGRANT CONNECT ON DATABASE ${DEST_DB_USERNAME} to \\1;/' \
+            | PGPASSWORD='${DEST_DB_PWD}' psql -h ${DEST_DB_HOST} -U postgres postgres"
+             sh "PGPASSWORD='${DEST_DB_PWD}' psql -h ${DEST_DB_HOST} -U postgres postgres -t -c \"select 'GRANT ' || rolname || ' TO postgres;' from pg_roles where rolname not like 'rds_%' and rolname not like 'pg_%'; \" > ${WORKSPACE_ARGS}/script.sql"
+             
+
+             // Roles migration at cluster level.
+             sh """
+                echo "Dumping of roles completed. starting restore process."
+                ${RESTORE_ROLES_USERS_CMD}
+                echo "Roles restore process complete successfully. proceeding to schema dump."
+                """
+             // schema migration at DB level.
+             sh """
+                ${DUMP_SRC_SCHEMA_DB_CMD}
+                echo "Dumping of DB Schema completed. starting restore process."
+                ${RESTORE_SRC_SCHEMA_DB_CMD}
+                echo "Schema restore complete. Proceeding to Data Migration."
+             """
+            }
+        }
+    }
+    stage('Data_Migration') {
+        steps {
+            script {
+             sh "python3 ${WORKSPACE}/scripts/data_migration_multiprocessing.py '${SRC_DB_HOST}' '${WORKSPACE_ARGS}'"
+            }
+        }
+    }
+  }
+}
